@@ -1,0 +1,122 @@
+name: caderno-de-campo
+
+# Arquitetura:
+#   Internet -> nginx (única porta publicada) -> frontend (React estático)
+#                                             -> backend (Node/Express) -> mysql
+# A rede "rede_interna" é "internal": nada nela é acessível de fora do Docker.
+# Somente o nginx participa também da "rede_publica", por isso só ele recebe tráfego externo.
+# O backend também usa a "rede_saida" apenas para ENVIAR e-mail (SMTP); ela não recebe tráfego.
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: cdc-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
+    networks:
+      - rede_publica
+      - rede_interna
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Chave PÚBLICA do Google Maps (vai para o JavaScript do navegador). Vazia = mapa em modo lista.
+        VITE_GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+    container_name: cdc-frontend
+    networks:
+      - rede_interna
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    container_name: cdc-backend
+    environment:
+      PORT: "3000"
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${MYSQL_DATABASE:?Defina MYSQL_DATABASE no .env}
+      DB_USER: ${MYSQL_USER:?Defina MYSQL_USER no .env}
+      DB_PASSWORD: ${MYSQL_PASSWORD:?Defina MYSQL_PASSWORD no .env}
+      JWT_SECRET: ${JWT_SECRET:?Defina JWT_SECRET no .env}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-2h}
+      # Administrador inicial (opcional): criado, ou promovido se o e-mail já existir, ao iniciar a API.
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_NOME: ${ADMIN_NOME:-Administrador}
+      ADMIN_CPF: ${ADMIN_CPF:-}
+      ADMIN_SENHA: ${ADMIN_SENHA:-}
+      # PDFs enviados nas contestações (volume nomeado, sobrevive a recriar o container).
+      UPLOADS_DIR: /app/uploads
+      # E-mail das decisões (opcional). Sem SMTP_HOST o sistema funciona e só registra que o e-mail não saiu.
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - uploads_data:/app/uploads
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - rede_interna
+      # Só o backend tem saída para a internet (enviar e-mail por SMTP). Não publica porta alguma.
+      - rede_saida
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.4
+    container_name: cdc-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Defina MYSQL_ROOT_PASSWORD no .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?Defina MYSQL_DATABASE no .env}
+      MYSQL_USER: ${MYSQL_USER:?Defina MYSQL_USER no .env}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Defina MYSQL_PASSWORD no .env}
+      TZ: America/Sao_Paulo
+    volumes:
+      # Volume nomeado: os dados sobrevivem a "docker compose down" e a reinícios.
+      - mysql_data:/var/lib/mysql
+      # Script de criação das tabelas (executado só na primeira inicialização do volume).
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - rede_interna
+    restart: unless-stopped
+
+networks:
+  rede_publica:
+    driver: bridge
+  rede_interna:
+    driver: bridge
+    internal: true
+  # Permite conexões DE SAÍDA (SMTP). Nada entra por aqui: nenhum serviço publica porta nesta rede.
+  rede_saida:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  uploads_data:
